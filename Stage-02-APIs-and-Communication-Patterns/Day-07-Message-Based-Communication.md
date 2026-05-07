@@ -1,4 +1,4 @@
-# Stage 2 — Topic 6: Message-Based Communication
+# Stage 2 — Topic 7: Message-Based Communication
 
 ## Theory
 
