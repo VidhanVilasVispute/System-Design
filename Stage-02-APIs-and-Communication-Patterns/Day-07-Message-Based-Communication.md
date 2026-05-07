@@ -1,593 +1,494 @@
-# Stage 2 — Topic 7: Publisher-Subscriber Model
+# Stage 2 — Topic 6: Message-Based Communication
 
 ## Theory
 
-We have touched on pub/sub across the last two topics. Now we go deep — the architecture, the patterns, the internals, and the nuances that make pub/sub one of the most powerful and most misused patterns in distributed systems.
+In the previous topic we established *why* asynchronous communication exists. Now we go deep on *how* it works — the infrastructure, patterns, and internals of message-based communication.
 
-**The Publisher-Subscriber model** is a messaging pattern where:
-- **Publishers** produce events without knowing who will consume them
-- **Subscribers** consume events without knowing who produced them
-- A **broker** sits in the middle, matching publishers to subscribers
-
-The defining characteristic is **complete decoupling** — publishers and subscribers have zero knowledge of each other. This is stronger than just async communication — it is architectural ignorance by design.
+**Message-based communication** means services talk to each other by sending messages through an intermediary — a **message broker**. Services never talk directly. They produce messages to the broker and consume messages from the broker.
 
 ```
-Traditional direct communication:
-  Order Service knows about → Notification Service
-  Order Service knows about → Inventory Service
-  Order Service knows about → Analytics Service
-  Order Service knows about → Loyalty Service
-  
-  Adding a new consumer = modifying Order Service
+Direct communication (no broker):
+  Service A ──────────────────────► Service B
+  Tight coupling — A must know B's address, B must be up
 
-Pub/Sub:
-  Order Service knows about → Event Broker only
-  Notification Service subscribes independently
-  Inventory Service subscribes independently
-  Analytics Service subscribes independently
-  Loyalty Service subscribes independently
-  
-  Adding a new consumer = zero changes to Order Service
+Message-based communication:
+  Service A ──► Broker ──► Service B
+  Loose coupling — A only knows the broker, not B
 ```
+
+The broker is the backbone of async architecture. It stores messages, routes them, manages delivery guarantees, and handles the mismatch between producer speed and consumer speed.
 
 ---
 
-## Internals — How Pub/Sub Works
+## Core Concepts — The Building Blocks
 
-### The Three Participants
+### Messages
 
-```
-Publisher (Producer):
-  - Knows the topic name
-  - Publishes events to that topic
-  - Has no knowledge of subscribers
-  - Does not wait for acknowledgement from subscribers
-
-Broker (Event Bus):
-  - Accepts events from publishers
-  - Stores events (temporarily or permanently)
-  - Routes events to all registered subscribers
-  - Manages subscriptions
-  - Handles delivery guarantees
-
-Subscriber (Consumer):
-  - Registers interest in a topic
-  - Receives events matching its subscription
-  - Processes events independently
-  - Has no knowledge of publisher identity
-```
-
-### The Full Flow
+A message is the unit of communication. It has two parts:
 
 ```
-t=0:  Order Service publishes to topic "order.confirmed":
-      {
-        "eventId":   "evt-abc-123",
-        "eventType": "ORDER_CONFIRMED",
-        "orderId":   "o-789",
-        "userId":    "u-123",
-        "total":     1299.99,
-        "timestamp": "2026-04-08T10:30:00Z"
-      }
-
-t=0:  Broker receives event, stores it, identifies all subscribers
-      Subscribers to "order.confirmed":
-        - notification-service
-        - inventory-service
-        - analytics-service
-        - loyalty-service
-
-t=0:  Broker delivers copy to each subscriber group
-
-t=1ms:  Notification Service receives event → queues email job
-t=3ms:  Inventory Service receives event → decrements stock
-t=5ms:  Analytics Service receives event → records revenue
-t=2ms:  Loyalty Service receives event → awards points
-
-All four happen in parallel, independently, at their own pace.
-```
-
----
-
-## Pub/Sub Topologies — How Events Are Structured
-
-### Topology 1 — Simple Fan-Out
-
-```
-One publisher → One topic → Multiple subscribers
-
-order-service ──► [order.confirmed] ──► notification-service
-                                    ──► inventory-service
-                                    ──► analytics-service
-
-Simple, clean. Every subscriber gets every event.
-```
-
-### Topology 2 — Filtered Subscription
-
-Subscribers declare interest in only certain events — not all events on a topic:
-
-```
-order-service publishes ALL order events to one topic:
-  ORDER_CREATED, ORDER_CONFIRMED, ORDER_SHIPPED, ORDER_DELIVERED, ORDER_CANCELLED
-
-Subscribers filter by event type:
-
-notification-service subscribes to:
-  ORDER_CONFIRMED, ORDER_SHIPPED, ORDER_DELIVERED, ORDER_CANCELLED
-  (needs to notify user at each stage)
-
-inventory-service subscribes to:
-  ORDER_CONFIRMED, ORDER_CANCELLED
-  (confirmed = decrement stock, cancelled = restore stock)
-
-analytics-service subscribes to:
-  ORDER_CONFIRMED, ORDER_CANCELLED
-  (revenue gained and refunded)
-
-loyalty-service subscribes to:
-  ORDER_CONFIRMED, ORDER_CANCELLED
-  (points awarded and revoked)
-```
-
-```java
-// Kafka — filter by event type in consumer
-@KafkaListener(topics = "order-events", groupId = "inventory-service")
-public void handleOrderEvent(OrderEvent event) {
-    // Filter to only events this service cares about
-    switch (event.getEventType()) {
-        case ORDER_CONFIRMED -> inventoryService.decrementStock(event);
-        case ORDER_CANCELLED -> inventoryService.restoreStock(event);
-        default -> { /* ignore — not relevant to inventory */ }
-    }
-}
-```
-
-### Topology 3 — Topic Hierarchy
-
-Organise events in a hierarchy — subscribers can subscribe broadly or narrowly:
-
-```
-Topic hierarchy (RabbitMQ topic exchange pattern):
-
-order.confirmed          ← specific
-order.cancelled          ← specific
-order.shipped            ← specific
-order.*                  ← all order events
-payment.succeeded        ← specific
-payment.failed           ← specific
-payment.*                ← all payment events
-#                        ← everything
-
-Notification Service subscribes to: order.* and payment.*
-Audit Service subscribes to:        #  (everything — for compliance log)
-Analytics Service subscribes to:    order.confirmed and payment.succeeded
-```
-
-### Topology 4 — Event Aggregation
-
-Multiple publishers, one subscriber aggregates:
-
-```
-order-service     ──►
-payment-service   ──► [transaction-events] ──► audit-service
-inventory-service ──►
-user-service      ──►
-
-Audit service subscribes to all services and builds a complete audit trail.
-No individual service needs to know about auditing.
-```
-
----
-
-## Event Design — What Makes a Good Event
-
-Event design is to pub/sub what API design is to REST. Bad event design creates downstream pain for every subscriber.
-
-### Event Naming — Past Tense, Happened Facts
-
-```
-Bad (commands — tells someone what to do):
-  SendEmail
-  DecrementStock
-  AwardPoints
-
-Bad (present tense — ambiguous timing):
-  OrderConfirming
-  PaymentProcessing
-
-Good (past tense — facts that happened):
-  OrderConfirmed
-  OrderCancelled
-  PaymentSucceeded
-  PaymentFailed
-  StockDepleted
-  UserRegistered
-```
-
-Events describe things that **already happened** — they are immutable facts. Commands tell someone what to do — those belong in queues, not pub/sub topics.
-
-### Event Payload Design — Fat Events vs Thin Events
-
-**Thin event (notification only):**
-```json
-{
-  "eventType": "ORDER_CONFIRMED",
-  "orderId": "o-789",
-  "timestamp": "2026-04-08T10:30:00Z"
-}
-```
-Subscriber receives this and must call Order Service to get the full order details.
-
-Problems:
-- Extra network call per subscriber per event
-- Order Service gets hammered after every event
-- If Order Service is down, subscribers cannot process the event
-
-**Fat event (self-contained):**
-```json
-{
-  "eventId":    "evt-abc-123",
-  "eventType":  "ORDER_CONFIRMED",
-  "timestamp":  "2026-04-08T10:30:00Z",
-  "orderId":    "o-789",
-  "userId":     "u-123",
-  "userEmail":  "vidhan@example.com",
-  "total":      1299.99,
-  "items": [
-    { "productId": "p-456", "name": "Nike Shoes", "qty": 2, "price": 649.99 }
-  ],
-  "shippingAddress": {
-    "line1": "123 Main St",
-    "city":  "Nagpur",
-    "pin":   "440001"
-  }
-}
-```
-
-Subscriber has everything it needs — no additional calls required.
-
-**Trade-offs:**
-```
-Thin events:
-  ✅ Small payload size
-  ✅ No data duplication
-  ❌ Subscribers must make additional service calls
-  ❌ Tight temporal coupling — subscriber needs publisher available
-
-Fat events:
-  ✅ Subscribers are self-sufficient — no additional calls
-  ✅ Works even if publisher is temporarily down
-  ✅ Natural for event sourcing and audit logs
-  ❌ Larger payload size
-  ❌ Data duplication across events
-  ❌ If schema changes, all subscribers must update
-```
-
-**ShopSphere approach — fat events for domain events:**
-Order-level events carry the full order snapshot. Subscribers process them independently. The slight payload increase is worth the resilience and simplicity.
-
-### Event Versioning — Evolving Events Over Time
-
-Events are harder to version than APIs because they may be stored for months and replayed:
-
-**Strategy 1 — Version in event type:**
-```json
-{
-  "eventType": "ORDER_CONFIRMED_V2",
-  "version": 2,
-  ...new fields...
-}
-```
-
-**Strategy 2 — Version in schema (backward compatible additions only):**
-```json
-// V1 — original
-{ "eventType": "ORDER_CONFIRMED", "orderId": "o-789", "total": 1299.99 }
-
-// V2 — added optional field, backward compatible
-{ "eventType": "ORDER_CONFIRMED", "orderId": "o-789", "total": 1299.99, "promoCode": "SAVE10" }
-
-// Old subscribers ignore unknown fields — no code change needed
-// New subscribers can use promoCode if present
-```
-
-**Strategy 3 — Consumer-driven contract testing:**
-Each consumer publishes the event fields it depends on. The publisher runs tests ensuring its events satisfy all consumer contracts before deploying a change.
-
----
-
-## Pub/Sub vs Observer Pattern — Know the Difference
-
-The Observer pattern is pub/sub's in-process cousin — important for interviews:
-
-```
-Observer Pattern (in-process, same JVM):
-  Subject maintains a list of Observer objects
-  When state changes, Subject calls observer.update() directly
-  Observers are registered explicitly with Subject
-  All in one process — no network, no broker
-  
-  Example: Spring ApplicationEvent / ApplicationListener
-
-Pub/Sub Pattern (distributed, across services):
-  Publishers and subscribers know only the broker
-  Broker handles routing, delivery, persistence
-  Across network boundaries, separate processes
-  Broker provides durability — messages survive crashes
-  
-  Example: Kafka, RabbitMQ, AWS SNS/SQS
-```
-
-```java
-// Observer Pattern — Spring ApplicationEvent (in-process pub/sub)
-// Publisher
-@Service
-public class OrderService {
-    @Autowired
-    private ApplicationEventPublisher eventPublisher;
+Message:
+  Header (metadata):
+    messageId:     "msg-abc-123"        ← unique ID
+    correlationId: "order-o-789"        ← links to originating operation
+    timestamp:     "2026-04-08T10:30Z"
+    contentType:   "application/json"
+    source:        "order-service"
+    retryCount:    0
     
-    public Order createOrder(CreateOrderRequest request) {
-        Order order = orderRepository.save(buildOrder(request));
-        
-        // Publish in-process event — synchronous by default
-        eventPublisher.publishEvent(new OrderCreatedEvent(this, order));
-        
-        return order;
+  Body (payload):
+    {
+      "eventType": "ORDER_CONFIRMED",
+      "orderId":   "o-789",
+      "userId":    "u-123",
+      "total":     1299.99,
+      "items":     [...]
     }
-}
-
-// Subscriber — same JVM
-@Component
-public class OrderCreatedEventListener {
-    
-    @EventListener
-    @Async  // makes it asynchronous — runs in separate thread
-    public void handleOrderCreated(OrderCreatedEvent event) {
-        auditService.record(event.getOrder());
-    }
-}
 ```
 
-**When to use Spring ApplicationEvent vs Kafka:**
-```
-Spring ApplicationEvent:
-  Same service, in-process communication
-  No persistence needed
-  Decoupling within a monolith or within one service's components
-  Low overhead — no network hop
+The header is for infrastructure — routing, tracing, deduplication. The body is for business logic — what actually happened.
 
-Kafka/RabbitMQ:
-  Cross-service communication
-  Persistence needed — survive crashes
-  Multiple independent services need the event
-  High volume requiring durability and replay
+### Queues vs Topics — The Fundamental Split
+
+This is the most important distinction in message-based communication:
+
+**Queue — point-to-point:**
 ```
+Producer ──► [Queue] ──► ONE Consumer
+
+Properties:
+  - Each message is delivered to exactly ONE consumer
+  - Competing consumers share the workload
+  - Message is deleted after successful consumption
+  - Used for task distribution — work that needs to happen once
+
+Example:
+  Order Service ──► [email-queue] ──► Notification Service instance 1
+                                  or  Notification Service instance 2
+                                  or  Notification Service instance 3
+  (whichever is free processes it — load balanced automatically)
+```
+
+**Topic — publish/subscribe:**
+```
+Producer ──► [Topic] ──► Consumer Group A (all instances get it)
+                     ──► Consumer Group B (all instances get it)
+                     ──► Consumer Group C (all instances get it)
+
+Properties:
+  - Each message is delivered to ALL subscriber groups
+  - Within a group, one instance processes each message
+  - Message is retained for a configurable period (not deleted on consumption)
+  - Used for event broadcasting — things that happened that many services care about
+
+Example:
+  Order Service ──► [order-confirmed topic]
+                        ──► Notification Service consumer group  → sends email
+                        ──► Inventory Service consumer group     → decrements stock
+                        ──► Analytics Service consumer group     → records revenue
+                        ──► Loyalty Service consumer group       → awards points
+```
+
+**Queue = work distribution. Topic = event broadcasting.** Know this cold.
 
 ---
 
-## Backpressure in Pub/Sub — Handling Speed Mismatch
+## The Two Dominant Brokers — RabbitMQ vs Kafka
 
-A critical operational concern — what happens when publishers produce faster than subscribers consume?
+ShopSphere uses both. Understanding when to use each is a real interview question.
 
+### RabbitMQ — The Traditional Message Broker
+
+RabbitMQ is a **message broker** — its job is to route messages and ensure delivery. Once a message is consumed and acknowledged, it is gone.
+
+**Architecture:**
 ```
-Producer:   10,000 events/second
-Consumer:    2,000 events/second
-
-After 1 minute:
-  Unprocessed backlog: (10,000 - 2,000) × 60 = 480,000 messages
-
-After 1 hour:
-  Unprocessed backlog: 28,800,000 messages
-
-Consumer is drowning — latency grows indefinitely
-```
-
-**Solutions:**
-
-**1. Scale consumers horizontally:**
-```
-Add more consumer instances
-Each gets a partition → parallel processing
-5 consumer instances × 2,000 events/second = 10,000 events/second
-Matches producer rate
+Producer
+   │
+   ▼
+Exchange  ←── routing rules (bindings)
+   │
+   ├──► Queue A  ──► Consumer Group A
+   ├──► Queue B  ──► Consumer Group B
+   └──► Queue C  ──► Consumer Group C
 ```
 
-**2. Consumer backpressure signalling:**
-```
-Kafka pull model naturally handles this:
-  Consumer pulls messages at its own pace
-  If consumer is slow — it just pulls less frequently
-  Messages wait safely in the partition
-  No overwhelming of consumer
-
-RabbitMQ push model — configure prefetch:
-  channel.basicQos(10) — broker sends max 10 unacked messages at once
-  Consumer must ACK before broker sends more
-  Prevents consumer from being flooded
-```
-
-**3. Alerting on consumer lag:**
-```
-Monitor consumer group lag:
-  Lag = latest offset - consumer committed offset
-
-Alert if lag exceeds threshold:
-  lag > 10,000 → warning
-  lag > 100,000 → critical — scale consumers or investigate
-
-In ShopSphere: Prometheus + Grafana dashboards on Kafka consumer lag
-```
-
----
-
-## Fan-Out Problem — The Celebrity Problem in Pub/Sub
-
-When one event generates an enormous number of downstream operations:
+**Exchange types — how messages are routed:**
 
 ```
-Scenario: A celebrity user with 10 million followers places an order
-          (analogous to posting a tweet)
+Direct Exchange:
+  Route by exact routing key
+  order.confirmed → notification-queue (exact match)
+  order.cancelled → refund-queue       (exact match)
 
-Event: USER_ACTIVITY published
-Subscriber: Feed Service must update 10 million follower feeds
-            → 10 million write operations from one event
-            → Fan-out explosion
+Topic Exchange:
+  Route by pattern matching
+  order.*   → all order events queue
+  *.failed  → all failure events queue
+  #         → everything queue (# matches zero or more words)
+
+Fanout Exchange:
+  Broadcast to ALL bound queues regardless of routing key
+  Notification to every subscriber — no filtering
+
+Headers Exchange:
+  Route by message header attributes
+  contentType=invoice AND region=india → india-invoice-queue
 ```
 
-**Solutions:**
-
-**Fan-out on write (precompute):**
+**RabbitMQ delivery guarantees:**
 ```
-When event published → immediately write to all 10 million feeds
-Pros: Feed reads are instant — already computed
-Cons: Write amplification — one event = 10 million writes
-     Delayed for high-follower users during spike
+At most once:  message delivered 0 or 1 times (fire and forget, can lose messages)
+At least once: message delivered 1 or more times (duplicates possible, no loss)
+Exactly once:  not natively supported — requires idempotent consumers
 ```
 
-**Fan-out on read (lazy compute):**
-```
-When event published → store once
-When follower reads feed → compute their feed at read time
-Pros: No write amplification
-Cons: Feed read is slower — computed on demand
-```
-
-**Hybrid (real Twitter/Instagram approach):**
-```
-Regular users (< 1M followers): fan-out on write — precompute feeds
-Celebrity users (> 1M followers): fan-out on read — compute at read time
-                                  and cache aggressively
-
-ShopSphere equivalent:
-  Regular sellers: precompute product recommendations
-  Top sellers with millions of followers: compute on read with Redis cache
-```
-
----
-
-## Real-World Example — ShopSphere Complete Pub/Sub Architecture
-
+**Acknowledgement model:**
 ```java
-// Order Service — publishes domain events
-@Service
-@Slf4j
-public class OrderEventPublisher {
-
-    @Autowired
-    private KafkaTemplate<String, OrderEvent> kafkaTemplate;
-    
-    @Autowired
-    private OutboxRepository outboxRepository;
-
-    @Transactional
-    public void publishOrderConfirmed(Order order) {
-        OrderConfirmedEvent event = OrderConfirmedEvent.builder()
-            .eventId(UUID.randomUUID().toString())
-            .eventType("ORDER_CONFIRMED")
-            .timestamp(Instant.now().toString())
-            .orderId(order.getId())
-            .userId(order.getUserId())
-            .userEmail(order.getUserEmail())
-            .total(order.getTotal())
-            .items(order.getItems().stream()
-                .map(this::mapItem)
-                .collect(Collectors.toList()))
-            .build();
-
-        // Outbox pattern — save atomically with order
-        outboxRepository.save(OutboxEvent.from(event));
-        
-        log.info("OrderConfirmed event queued in outbox: {}", event.getOrderId());
-    }
-}
-
-// ─────────────────────────────────────────────────────
-// Notification Service — subscribes to order events
-@Service
-@Slf4j
-public class OrderNotificationConsumer {
-
-    @KafkaListener(
-        topics = "order-events",
-        groupId = "notification-service",
-        containerFactory = "kafkaListenerContainerFactory"
-    )
-    public void consume(OrderEvent event,
-                        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
-                        @Header(KafkaHeaders.OFFSET) long offset) {
-        
-        log.info("Received {} at offset {}", event.getEventType(), offset);
-        
-        // Idempotency check
-        if (processedEvents.contains(event.getEventId())) {
-            log.warn("Duplicate event {}, skipping", event.getEventId());
-            return;
-        }
-        
-        switch (event.getEventType()) {
-            case "ORDER_CONFIRMED" -> {
-                emailService.sendOrderConfirmation(
-                    event.getUserEmail(),
-                    event.getOrderId(),
-                    event.getTotal()
-                );
-                smsService.sendConfirmation(event.getUserId(), event.getOrderId());
-            }
-            case "ORDER_SHIPPED" -> {
-                emailService.sendShippingNotification(
-                    event.getUserEmail(),
-                    event.getTrackingNumber()
-                );
-            }
-            case "ORDER_DELIVERED" -> {
-                emailService.sendDeliveryConfirmation(event.getUserEmail());
-                reviewRequestService.scheduleReviewRequest(
-                    event.getUserId(), event.getOrderId()
-                );
-            }
-        }
-        
-        processedEvents.add(event.getEventId()); // mark as processed
-    }
-}
-
-// ─────────────────────────────────────────────────────
-// Inventory Service — subscribes independently
-@Service
-public class InventoryEventConsumer {
-
-    @KafkaListener(topics = "order-events", groupId = "inventory-service")
-    public void consume(OrderEvent event) {
-        switch (event.getEventType()) {
-            case "ORDER_CONFIRMED" ->
-                inventoryService.decrementStock(event.getItems());
-            case "ORDER_CANCELLED" ->
-                inventoryService.restoreStock(event.getItems());
-        }
+// Manual acknowledgement — RabbitMQ holds message until ACK received
+@RabbitListener(queues = "order.notifications")
+public void handleOrderConfirmed(OrderConfirmedEvent event, Channel channel,
+                                  @Header(AmqpHeaders.DELIVERY_TAG) long tag)
+        throws IOException {
+    try {
+        emailService.send(event.getUserId(), event.getOrderId());
+        channel.basicAck(tag, false);    // ✅ success — message deleted from queue
+    } catch (Exception e) {
+        channel.basicNack(tag, false, true);  // ❌ failure — requeue for retry
     }
 }
 ```
+
+If the consumer crashes before ACKing, RabbitMQ redelivers to another consumer — no message loss.
+
+**Dead Letter Queue (DLQ):**
+```
+Message fails processing → retried N times → sent to Dead Letter Queue
+
+DLQ is a queue for messages that could not be processed.
+Operations team inspects, fixes, and republishes from DLQ.
+Without DLQ, failed messages are lost or block the queue forever.
+```
+
+```yaml
+# Spring Boot RabbitMQ DLQ configuration
+spring:
+  rabbitmq:
+    listener:
+      simple:
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1000    # 1 second
+          multiplier: 2             # exponential backoff
+          max-interval: 10000       # max 10 seconds
+```
+
+---
+
+### Kafka — The Distributed Event Log
+
+Kafka is fundamentally different from RabbitMQ. It is not a message broker — it is a **distributed append-only log**. Messages are not deleted after consumption. The log is the source of truth.
+
+**Architecture:**
+```
+Producers
+   │
+   ▼
+Topic: order-events
+  Partition 0: [msg1][msg3][msg5][msg7]...  ← append only, immutable
+  Partition 1: [msg2][msg4][msg6][msg8]...  ← append only, immutable
+  Partition 2: [msg9][msg10][msg11]...      ← append only, immutable
+
+Consumer Group A (Notification):
+  Instance 1 → reads Partition 0
+  Instance 2 → reads Partition 1
+  Instance 3 → reads Partition 2
+
+Consumer Group B (Analytics):
+  Instance 1 → reads Partition 0  ← completely independent offset
+  Instance 2 → reads Partition 1  ← does not affect Group A's progress
+```
+
+**The Log — Kafka's core concept:**
+```
+Offset:  0      1      2      3      4      5      6
+         │      │      │      │      │      │      │
+         ▼      ▼      ▼      ▼      ▼      ▼      ▼
+        [e1]  [e2]  [e3]  [e4]  [e5]  [e6]  [e7]
+
+Consumer Group A offset: 6 (has read up to e6)
+Consumer Group B offset: 4 (is behind — still processing)
+Consumer Group C offset: 7 (fully caught up)
+
+Messages are NOT deleted when consumed.
+Retention period determines when they are deleted (e.g. 7 days).
+```
+
+**Why this matters:**
+- Consumer can re-read messages — replay from offset 0 to rebuild state
+- New consumer group can start from the beginning and process all historical events
+- Multiple consumer groups are completely independent — one being slow does not affect others
+- Event sourcing is natural — the log IS the history
+
+**Partitioning — Kafka's scalability mechanism:**
+```
+Partition key determines which partition a message goes to:
+  key = userId → all events for user U always go to same partition
+
+Why this matters for ordering:
+  Kafka only guarantees ordering WITHIN a partition
+  Events for the same order must go to the same partition
+  → use orderId as partition key
+
+Parallelism:
+  10 partitions → up to 10 consumers in a group process in parallel
+  Want more parallelism? Add more partitions.
+  Each partition is an independent ordered log.
+```
+
+**Kafka producer configuration — the throughput vs latency trade-off:**
+```java
+@Configuration
+public class KafkaProducerConfig {
+
+    @Bean
+    public ProducerFactory<String, Object> producerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+        
+        // Durability
+        config.put(ProducerConfig.ACKS_CONFIG, "all");
+        // "all" → wait for all in-sync replicas to acknowledge
+        // "1"   → wait only for leader acknowledgement (faster, less durable)
+        // "0"   → fire and forget (fastest, can lose messages)
+        
+        // Throughput optimisation
+        config.put(ProducerConfig.LINGER_MS_CONFIG, 5);
+        // Wait 5ms to batch messages before sending
+        // Increases throughput at cost of 5ms latency
+        
+        config.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
+        // Batch up to 16KB before sending
+        
+        config.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "snappy");
+        // Compress batches — reduces bandwidth, increases CPU usage
+        
+        // Reliability
+        config.put(ProducerConfig.RETRIES_CONFIG, 3);
+        config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        // Exactly once semantics — no duplicate messages on retry
+        
+        return new DefaultKafkaProducerFactory<>(config);
+    }
+}
+```
+
+**Kafka consumer configuration:**
+```java
+@KafkaListener(
+    topics = "order-events",
+    groupId = "notification-service",
+    concurrency = "3"              // 3 threads, one per partition
+)
+public void handleOrderEvent(
+        OrderEvent event,
+        @Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
+        @Header(KafkaHeaders.OFFSET) long offset) {
+    
+    log.info("Processing event at partition={} offset={}", partition, offset);
+    
+    try {
+        notificationService.process(event);
+        // Offset committed automatically after successful processing
+    } catch (Exception e) {
+        // Kafka has no DLQ natively — implement manually or use Spring's error handler
+        errorHandler.handle(event, e);
+    }
+}
+```
+
+---
+
+## RabbitMQ vs Kafka — The Decision Framework
+
+| Dimension | RabbitMQ | Kafka |
+|---|---|---|
+| Core model | Message broker — route and delete | Distributed log — append and retain |
+| Message retention | Deleted after consumption | Retained by time/size policy |
+| Ordering | Per-queue ordering | Per-partition ordering |
+| Throughput | High (tens of thousands/sec) | Very high (millions/sec) |
+| Replay | Not supported natively | Core feature — replay from any offset |
+| Consumer model | Push (broker pushes to consumer) | Pull (consumer polls broker) |
+| Routing | Sophisticated (exchanges, bindings) | Simple (topic + partition key) |
+| Complexity | Lower — simpler operational model | Higher — partitions, consumer groups, offsets |
+| Best for | Task queues, RPC, complex routing | Event streaming, audit log, replay, high volume |
+
+**Choose RabbitMQ when:**
+- You need complex routing logic (different messages to different queues based on content)
+- Task distribution — N workers sharing a queue of jobs
+- Request/reply async pattern — built-in correlation and reply-to
+- Simpler operational requirements
+- Messages should be deleted once processed
+
+**Choose Kafka when:**
+- You need multiple independent consumers reading the same events
+- Replay is required — rebuilding state, onboarding new services
+- Very high throughput (millions of events/second)
+- Event sourcing or audit log patterns
+- Stream processing with Kafka Streams or Flink
+
+---
+
+## Message Delivery Guarantees — Critical for Interviews
+
+```
+At most once:
+  Message sent once, consumer processes it once or not at all.
+  How: auto-ack before processing
+  Risk: consumer crashes after receiving but before processing → message lost
+  Use: metrics, telemetry — losing occasional datapoints is acceptable
+
+At least once:
+  Message delivered until consumer acknowledges it.
+  How: manual ack after processing
+  Risk: consumer processes successfully but crashes before ACKing
+       → redelivered → processed twice
+  Requirement: consumers must be IDEMPOTENT
+  Use: most business operations — prefer duplicates over loss
+
+Exactly once:
+  Message processed exactly one time, no duplicates, no loss.
+  How: Kafka idempotent producer + transactional API
+       or deduplication at consumer with idempotency keys
+  Cost: higher latency, more complex
+  Use: financial transactions, inventory updates
+```
+
+**Making consumers idempotent — the practical solution:**
+```java
+@KafkaListener(topics = "order-events")
+public void handle(OrderConfirmedEvent event) {
+
+    // Idempotency check — have we already processed this event?
+    if (processedEventRepository.existsById(event.getMessageId())) {
+        log.info("Duplicate event {}, skipping", event.getMessageId());
+        return;  // already processed — safe to skip
+    }
+    
+    // Process the event
+    loyaltyService.awardPoints(event.getUserId(), event.getTotal());
+    
+    // Record that we processed it
+    processedEventRepository.save(new ProcessedEvent(event.getMessageId()));
+    
+    // Now safe to ACK — even if redelivered, we will skip it
+}
+```
+
+---
+
+## The Outbox Pattern — Guaranteed Event Publishing
+
+This is a Stage 7 pattern but essential to understand alongside message-based communication because it solves a critical problem:
+
+**The problem:**
+```java
+// DANGEROUS — two operations, no atomicity
+orderRepository.save(order);        // ① DB write succeeds
+kafkaTemplate.send("order-events"); // ② Kafka publish fails
+
+// Order saved but event never published
+// Inventory never decremented, email never sent, loyalty never awarded
+// System is in inconsistent state
+```
+
+**The Outbox Pattern — solve it with atomicity:**
+```java
+// SAFE — single DB transaction
+@Transactional
+public void createOrder(Order order) {
+    orderRepository.save(order);           // ① save order
+    outboxRepository.save(OutboxEvent      // ② save event to same DB
+        .builder()
+        .aggregateId(order.getId())
+        .eventType("ORDER_CONFIRMED")
+        .payload(serialize(order))
+        .build());
+    // Both succeed or both fail — atomic
+}
+
+// Separate outbox processor publishes to Kafka
+@Scheduled(fixedDelay = 1000)
+public void publishOutboxEvents() {
+    List<OutboxEvent> pending = outboxRepository.findUnpublished();
+    for (OutboxEvent event : pending) {
+        kafkaTemplate.send("order-events", event.getPayload());
+        outboxRepository.markPublished(event.getId());
+    }
+}
+```
+
+The order and the event are saved atomically in the same DB transaction. The outbox processor reliably publishes them. If publishing fails, it retries. No inconsistency possible.
+
+---
+
+## Real-World Example — ShopSphere Message Architecture
+
+```
+ShopSphere message topology:
+
+RabbitMQ (task queues):
+  notification-queue        ← email/SMS jobs, processed by Notification Service workers
+  payment-retry-queue       ← failed payment retries with TTL-based delay
+  report-generation-queue   ← async report generation jobs
+
+Kafka (event streaming):
+  order-events              ← ORDER_CREATED, ORDER_CONFIRMED, ORDER_CANCELLED
+    Consumers:
+      notification-service-group  → confirmation email
+      inventory-service-group     → stock decrement
+      analytics-service-group     → revenue recording
+      loyalty-service-group       → points award
+      search-service-group        → order history index
+
+  product-events            ← PRODUCT_CREATED, PRICE_UPDATED, STOCK_CHANGED
+    Consumers:
+      search-service-group        → Elasticsearch index update
+      cdn-invalidation-group      → invalidate cached product pages
+      recommendation-group        → retrain recommendation model
+
+  payment-events            ← PAYMENT_SUCCESS, PAYMENT_FAILED, REFUND_PROCESSED
+    Consumers:
+      order-service-group         → update order status
+      notification-service-group  → payment receipt or failure email
+      analytics-service-group     → financial recording
+```
+
+**Rule of thumb for ShopSphere:**
+- **Kafka** for domain events — things that happened that multiple services care about
+- **RabbitMQ** for task queues — jobs that need exactly one worker to process them
 
 ---
 
 ## Interview Q&A
 
-**Q: What is the pub/sub pattern and how does it differ from direct service calls?**
-In pub/sub, publishers emit events to a broker without knowing who consumes them, and subscribers consume events without knowing who produced them. In direct service calls, the caller knows the callee's address and calls it explicitly — tight coupling. Pub/sub provides complete decoupling — adding a new consumer requires zero changes to the publisher. It also provides temporal decoupling — publisher and subscriber do not need to be available simultaneously.
+**Q: What is the difference between a queue and a topic in message-based communication?**
+A queue delivers each message to exactly one consumer — multiple consumers compete to process messages, distributing the workload. A topic delivers each message to all subscriber groups — each group gets its own copy and processes it independently. Queues are for task distribution where work should happen once. Topics are for event broadcasting where multiple services need to react to the same event.
 
-**Q: What is the difference between a fat event and a thin event?**
-A thin event carries only identifiers — the subscriber must call back to the source service to get full details. This adds a network round trip per subscriber per event and creates temporal coupling — if the source service is down, subscribers cannot process the event. A fat event carries the complete snapshot of state at the time of the event — subscribers are self-sufficient and can process the event without any additional calls. Fat events are preferred for domain events because they improve resilience and simplicity at the cost of slightly larger payloads.
+**Q: What is the difference between RabbitMQ and Kafka?**
+RabbitMQ is a message broker — it routes messages to queues and deletes them after consumption. It excels at complex routing, task queues, and request/reply patterns. Kafka is a distributed append-only log — messages are retained after consumption and consumers track their own offsets. Kafka excels at high throughput event streaming, multiple independent consumers reading the same events, and replay — rebuilding state by re-reading historical events. Use RabbitMQ for work queues and routing logic, Kafka for event streams and audit logs.
 
-**Q: How do you handle schema evolution for events in a pub/sub system?**
-Events are harder to evolve than APIs because they may be stored and replayed months later. Safe evolution means only adding optional fields — existing subscribers ignore unknown fields. Never remove or rename fields — mark them deprecated and maintain them. For breaking changes, introduce a new event type version and publish both old and new until all subscribers migrate. Consumer-driven contract testing helps catch breaking changes before deployment by validating that published events satisfy the fields each subscriber depends on.
+**Q: What does at-least-once delivery mean and how do you handle it?**
+At-least-once means the broker guarantees a message is delivered but may deliver it more than once — if a consumer processes the message but crashes before acknowledging, the broker redelivers it. The consumer must be idempotent — processing the same message twice produces the same result as processing it once. Implement this by checking a processed-event store before processing and recording completion after — duplicate deliveries are detected and skipped safely.
 
-**Q: What is backpressure in pub/sub and how do you handle it?**
-Backpressure occurs when producers publish events faster than consumers can process them, causing the backlog to grow indefinitely. Kafka's pull model naturally handles this — consumers pull at their own pace and the backlog waits safely in partitions. For RabbitMQ's push model, configure prefetch limits so the broker only sends a bounded number of unacknowledged messages at once. Long-term solutions are scaling consumer instances horizontally to match production rate, and alerting on consumer group lag so backlogs are caught before they become critical.
+**Q: What is the Outbox Pattern and why is it needed?**
+Without the Outbox Pattern, saving to the database and publishing an event are two separate operations with no atomicity — one can succeed while the other fails, leaving the system inconsistent. The Outbox Pattern saves the event to an outbox table in the same database transaction as the business entity — both succeed or both fail atomically. A separate processor then publishes events from the outbox to the message broker. This guarantees that every committed business operation eventually produces its corresponding event with no possibility of silent loss.
 
-**Q: How does pub/sub relate to the Observer pattern?**
-The Observer pattern is pub/sub within a single process — a subject maintains a list of observer objects and calls them directly when state changes. Pub/sub is the distributed equivalent — publishers and subscribers are in separate processes or services, communicating through a broker that handles persistence, routing, and delivery guarantees. Spring ApplicationEvent is an in-process pub/sub mechanism suitable for decoupling within a single service. Kafka and RabbitMQ are distributed pub/sub mechanisms suitable for cross-service communication with durability requirements.
+**Q: How does Kafka guarantee ordering?**
+Kafka guarantees ordering within a partition — all messages in a single partition are delivered in the order they were written. Ordering across partitions is not guaranteed. To ensure all events for a given entity arrive in order, use that entity's ID as the partition key — all events for the same order, user, or product will always go to the same partition and be processed in sequence. The number of partitions determines the maximum parallelism — each partition can be consumed by at most one consumer within a group.
 
 ---
 
-Say **"next"** when ready for Topic 8 — Event-Driven Architecture.
+Say **"next"** when ready for Topic 7 — Publisher-Subscriber Model.
