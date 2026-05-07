@@ -1,553 +1,594 @@
-# Stage 2 — Topic 3: gRPC (Deep Dive)
+# Stage 2 — Topic 4: GraphQL (Deep Dive)
 
 ## Theory
 
-We covered gRPC's basics in Stage 1 Topic 11. Now we go deep — the internals of Protobuf, how HTTP/2 is used under the hood, all four communication patterns with real code, error handling, interceptors, and exactly how gRPC fits into ShopSphere's internal architecture.
+We covered GraphQL's basics in Stage 1 Topic 11. Now we go deep — the execution model, the type system, the N+1 problem and DataLoader solution, schema design, security, and exactly where GraphQL fits in ShopSphere's architecture.
 
-**The core philosophy of gRPC:**
-REST asks — *"what resource do you want and what do you want to do to it?"*
-gRPC asks — *"what function do you want to call on that remote service?"*
+**The origin story matters here:**
 
-This is **RPC — Remote Procedure Call** — making a call to code on another machine feel like calling a local function. gRPC is Google's open-source implementation of this idea, built for production microservices at massive scale.
+Facebook built GraphQL in 2012 to solve a specific problem — their mobile app was on 2G networks, the REST API was returning massive JSON payloads full of unused data, and the iOS and Android apps needed completely different data shapes for the same screens. Every time the product team changed the UI, backend engineers had to build new endpoints or modify existing ones.
 
-**Why Google built it:**
-Google runs thousands of microservices making billions of inter-service calls per second. JSON over HTTP/1.1 was too slow, too large, and too loosely typed. They needed something faster, smaller, and with strict contracts enforced at compile time — hence Protobuf + HTTP/2.
+GraphQL flipped the model — **the client declares what it needs, the server delivers exactly that.** One endpoint. No versioning. Frontend teams move independently of backend teams.
 
 ---
 
-## Internals — Protocol Buffers (Protobuf)
+## Internals — The GraphQL Execution Model
 
-Protobuf is the serialisation format gRPC uses. Understanding it deeply is what separates a surface-level gRPC answer from a strong one.
+Understanding how GraphQL actually executes a query is what makes the N+1 problem and DataLoader make complete sense.
 
-### How Protobuf Encodes Data
+### The Type System — Schema Definition Language (SDL)
 
-JSON is text — human readable, self-describing, verbose:
-```json
+Everything in GraphQL starts with the schema. The schema is the contract — it defines every type, every field, every query, mutation, and subscription the server exposes:
+
+```graphql
+# Scalar types — leaf values
+scalar DateTime
+scalar Decimal
+
+# Object types — structured data
+type Order {
+  id:           ID!              # ! means non-nullable — always present
+  status:       OrderStatus!
+  total:        Decimal!
+  createdAt:    DateTime!
+  customer:     User!            # nested object — resolver fetches this
+  items:        [OrderItem!]!    # list of non-nullable items, list itself non-nullable
+  shipment:     Shipment         # nullable — might not exist yet
+}
+
+type OrderItem {
+  id:        ID!
+  product:   Product!
+  quantity:  Int!
+  price:     Decimal!
+}
+
+type User {
+  id:        ID!
+  name:      String!
+  email:     String!
+  orders:    [Order!]!
+}
+
+type Product {
+  id:          ID!
+  name:        String!
+  price:       Decimal!
+  description: String
+  category:    Category!
+  inventory:   Int!
+}
+
+# Enum type
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+# Entry points — how clients interact
+type Query {
+  order(id: ID!):          Order
+  orders(filter: OrderFilter, pagination: PaginationInput): OrderConnection!
+  product(id: ID!):        Product
+  products(filter: ProductFilter): ProductConnection!
+  me:                      User!
+}
+
+type Mutation {
+  createOrder(input: CreateOrderInput!):   OrderPayload!
+  cancelOrder(orderId: ID!):              OrderPayload!
+  updateProfile(input: UpdateProfileInput!): UserPayload!
+}
+
+type Subscription {
+  orderStatusChanged(orderId: ID!): OrderUpdate!
+}
+
+# Input types — for mutations
+input CreateOrderInput {
+  items:             [OrderItemInput!]!
+  paymentMethodId:   ID!
+  shippingAddressId: ID!
+  promoCode:         String
+}
+
+input OrderItemInput {
+  productId: ID!
+  quantity:  Int!
+}
+
+# Payload types — mutation responses
+type OrderPayload {
+  order:  Order
+  errors: [UserError!]!
+}
+
+type UserError {
+  field:   String
+  message: String!
+}
+```
+
+**Nullability is part of your contract:**
+```graphql
+name: String!   ← guaranteed to always be present — client can depend on it
+name: String    ← might be null — client must handle null case
+
+List nullability matters too:
+[OrderItem!]!   ← list always present, items never null
+[OrderItem]!    ← list always present, but items might be null
+[OrderItem!]    ← list might be null, but if present items are not null
+[OrderItem]     ← both list and items might be null
+```
+
+Design your schema with explicit nullability — it communicates guarantees to consumers.
+
+---
+
+### The Resolver Chain — How GraphQL Executes
+
+This is the most important internal to understand. Every field in GraphQL is resolved by a **resolver function** — a function that knows how to fetch that specific piece of data.
+
+```
+Query:
 {
-  "orderId": "o-789",
-  "status": "CONFIRMED",
-  "total": 1299.99,
-  "itemCount": 3
-}
-→ ~70 bytes, includes field names in every message
-```
-
-Protobuf is binary — compact, schema-dependent, not self-describing:
-```
-Field 1 (orderId):    type=string, value="o-789"
-Field 2 (status):     type=string, value="CONFIRMED"
-Field 3 (total):      type=double, value=1299.99
-Field 4 (itemCount):  type=int32,  value=3
-→ ~25 bytes, field names NOT included — only field numbers
-```
-
-**The critical detail — field numbers, not names:**
-```protobuf
-message OrderResponse {
-  string order_id   = 1;   ← field number 1
-  string status     = 2;   ← field number 2
-  double total      = 3;   ← field number 3
-  int32  item_count = 4;   ← field number 4
+  order(id: "o-789") {
+    id
+    status
+    customer {
+      name
+      email
+    }
+    items {
+      quantity
+      product {
+        name
+        price
+      }
+    }
+  }
 }
 ```
 
-The wire format only contains `1: "o-789"`, `2: "CONFIRMED"`, `3: 1299.99`, `4: 3`. The schema (`.proto` file) is needed to decode what field number 1 means. This is why:
-- Protobuf messages are 3–10x smaller than JSON
-- You can **rename a field** without breaking compatibility — field number stays the same
-- You **cannot reuse a field number** — doing so corrupts existing data
+GraphQL executes this as a **tree of resolver calls:**
 
-### Protobuf Wire Types
-
-Every field is encoded as `(field_number << 3) | wire_type`:
-
-| Wire Type | Meaning | Used For |
-|---|---|---|
-| 0 | Varint | int32, int64, bool, enum |
-| 1 | 64-bit | double, fixed64 |
-| 2 | Length-delimited | string, bytes, nested messages, repeated |
-| 5 | 32-bit | float, fixed32 |
-
-**Varint encoding — why small integers are tiny:**
 ```
-int32 value 1    → 1 byte  (0x01)
-int32 value 300  → 2 bytes (0xAC 0x02)
-int32 value 1    vs JSON "itemCount": 1  → 1 byte vs 16 bytes
-```
+Root Query resolver:
+  order(id: "o-789")
+    → SQL: SELECT * FROM orders WHERE id = 'o-789'
+    → returns Order object
+    
+    ↓ field resolvers run on the returned Order object
 
-Varint uses variable-length encoding — small numbers use fewer bytes. This is why Protobuf is especially efficient for typical API data where most integers are small.
+  Order.id        → returns order.id       (trivial, no DB call)
+  Order.status    → returns order.status   (trivial, no DB call)
+  Order.customer  → SQL: SELECT * FROM users WHERE id = order.customerId
+                  → returns User object
+  
+    ↓ field resolvers run on the returned User object
+    
+    User.name     → returns user.name      (trivial)
+    User.email    → returns user.email     (trivial)
 
-### Schema Evolution — Forward and Backward Compatibility
+  Order.items     → SQL: SELECT * FROM order_items WHERE order_id = 'o-789'
+                  → returns [OrderItem] array
+  
+    ↓ field resolvers run on EACH item in the array
 
-This is critical in production microservices — services deploy independently and must remain compatible:
-
-**Safe changes (backward + forward compatible):**
-```protobuf
-// v1
-message OrderRequest {
-  string user_id = 1;
-  repeated string item_ids = 2;
-}
-
-// v2 — added optional field, safe
-message OrderRequest {
-  string user_id = 1;
-  repeated string item_ids = 2;
-  string promo_code = 3;       ← new optional field, old clients ignore it
-  optional string note = 4;    ← old clients send without it, new clients read it
-}
+    OrderItem[0].quantity  → trivial
+    OrderItem[0].product   → SQL: SELECT * FROM products WHERE id = item.productId
+    OrderItem[1].quantity  → trivial
+    OrderItem[1].product   → SQL: SELECT * FROM products WHERE id = item.productId
+    OrderItem[2].quantity  → trivial
+    OrderItem[2].product   → SQL: SELECT * FROM products WHERE id = item.productId
 ```
 
-**Breaking changes (never do these):**
-```protobuf
-// NEVER do this:
-message OrderRequest {
-  string user_id = 1;
-  repeated string item_ids = 3;  ← changed field number from 2 to 3 — BREAKS everything
-  string promo_code = 2;         ← reused field number 2 — CORRUPTS data
-}
-```
-
-**Deprecating a field safely:**
-```protobuf
-message OrderRequest {
-  string user_id = 1;
-  reserved 2;                    ← field 2 is reserved, cannot be reused
-  reserved "item_ids";           ← field name also reserved
-  repeated OrderItem items = 3;  ← new field at new number
-}
-```
+**This is exactly how the N+1 problem emerges.** For a list of 20 orders each needing customer data — 1 query for orders + 20 queries for customers = 21 queries. The resolver architecture makes this the natural default.
 
 ---
 
-## Internals — How gRPC Uses HTTP/2
+## The N+1 Problem and DataLoader
 
-gRPC maps RPC calls onto HTTP/2 streams:
+### The Problem in Detail
 
-```
-HTTP/2 Connection
-  │
-  ├── Stream 1: OrderService.CreateOrder
-  │     Headers: POST /OrderService/CreateOrder
-  │              content-type: application/grpc
-  │     Data:    [length-prefixed protobuf bytes]
-  │     Trailers: grpc-status: 0 (OK)
-  │
-  ├── Stream 3: InventoryService.CheckStock (concurrent)
-  │     Headers: POST /InventoryService/CheckStock
-  │     Data:    [protobuf bytes]
-  │     Trailers: grpc-status: 0
-  │
-  └── Stream 5: NotificationService.StreamUpdates (server streaming)
-        Headers: POST /NotificationService/StreamUpdates
-        Data:    [protobuf frame 1]
-                 [protobuf frame 2]
-                 [protobuf frame 3]  ← server keeps writing
-        Trailers: grpc-status: 0    ← only sent when stream ends
-```
-
-**gRPC message framing:**
-```
-Each message is prefixed with a 5-byte header:
-  Byte 0:   Compression flag (0 = not compressed, 1 = compressed)
-  Bytes 1-4: Message length (big-endian uint32)
-  Bytes 5+: Protobuf-encoded message body
-```
-
-**gRPC over HTTP/2 URL structure:**
-```
-POST /{package}.{ServiceName}/{MethodName}
-e.g.
-POST /com.shopsphere.order.OrderService/CreateOrder
-POST /com.shopsphere.inventory.InventoryService/CheckStock
-```
-
-This is always POST — gRPC does not use GET, PUT, DELETE. HTTP method semantics are irrelevant — the RPC method name carries the intent.
-
----
-
-## The Four Communication Patterns — In Depth
-
-### Pattern 1 — Unary RPC
-
-```protobuf
-service OrderService {
-  rpc CreateOrder (CreateOrderRequest) returns (OrderResponse);
+```graphql
+{
+  orders {           # 1 DB query → returns 20 orders
+    id
+    status
+    customer {       # 20 DB queries — one per order — THE N+1 PROBLEM
+      name
+    }
+    items {          # 20 DB queries — one per order
+      product {      # N queries per order × 20 orders — EXPONENTIAL
+        name
+        price
+      }
+    }
+  }
 }
 ```
 
+For 20 orders with 5 items each:
 ```
-Client                    Server
-  |--- CreateOrder req --->|
-  |                        | (processes synchronously)
-  |<-- OrderResponse ------|
+1   query  for orders
+20  queries for customers
+20  queries for order items lists
+100 queries for products (5 items × 20 orders)
+────────────────────────
+141 DB queries for one GraphQL request
 ```
 
-**When to use:** Any standard request-response. The most common pattern. Equivalent to a REST POST/GET.
+This kills performance at scale.
+
+### DataLoader — The Solution
+
+DataLoader was built by Facebook specifically to solve this. It works on two principles:
+
+**1. Batching — collect all IDs first, fetch in one query:**
+```
+Without DataLoader:
+  t=0ms: SELECT * FROM users WHERE id = 'u-001'
+  t=1ms: SELECT * FROM users WHERE id = 'u-002'
+  t=2ms: SELECT * FROM users WHERE id = 'u-003'
+  ...20 separate queries
+
+With DataLoader:
+  DataLoader collects all user IDs during the current execution tick
+  Then fires ONE batched query:
+  t=0ms: SELECT * FROM users WHERE id IN ('u-001','u-002','u-003',...,'u-020')
+  Maps results back to individual resolvers
+```
+
+**2. Caching — within a single request, never fetch the same ID twice:**
+```
+Order 1 and Order 3 both belong to customer u-005
+Without DataLoader: u-005 fetched twice
+With DataLoader:    u-005 fetched once, second resolver gets cached result
+```
+
+**DataLoader implementation in Java (with Spring + GraphQL):**
 
 ```java
-// Server implementation
-@Override
-public void createOrder(CreateOrderRequest request,
-                        StreamObserver<OrderResponse> responseObserver) {
-    // Business logic
-    Order order = orderService.create(request.getUserId(), request.getItemsList());
-    
-    OrderResponse response = OrderResponse.newBuilder()
-        .setOrderId(order.getId())
-        .setStatus(order.getStatus())
-        .setTotal(order.getTotal())
-        .build();
-    
-    responseObserver.onNext(response);      // send response
-    responseObserver.onCompleted();         // close stream
-}
+// Define a DataLoader for users
+@Component
+public class UserDataLoader implements BatchLoaderWithContext<String, User> {
 
-// Client call
-OrderResponse response = orderStub.createOrder(
-    CreateOrderRequest.newBuilder()
-        .setUserId("u-123")
-        .addItems(item)
-        .build()
-);
-```
+    @Autowired
+    private UserRepository userRepository;
 
----
-
-### Pattern 2 — Server Streaming RPC
-
-```protobuf
-service OrderService {
-  rpc StreamOrderUpdates (OrderStatusRequest) returns (stream OrderUpdate);
-}
-```
-
-```
-Client                         Server
-  |--- OrderStatusRequest --->|
-  |<-- OrderUpdate (1) -------|
-  |<-- OrderUpdate (2) -------|
-  |<-- OrderUpdate (3) -------|   ← server sends as events occur
-  |<-- stream closed  --------|
-```
-
-**When to use:** Server needs to push multiple responses over time. Order tracking, live price feeds, log streaming, progress updates.
-
-```java
-// Server implementation
-@Override
-public void streamOrderUpdates(OrderStatusRequest request,
-                               StreamObserver<OrderUpdate> responseObserver) {
-    String orderId = request.getOrderId();
-    
-    // Subscribe to order events
-    orderEventBus.subscribe(orderId, event -> {
-        OrderUpdate update = OrderUpdate.newBuilder()
-            .setOrderId(orderId)
-            .setStatus(event.getStatus())
-            .setTimestamp(event.getTimestamp())
-            .build();
+    @Override
+    public CompletionStage<List<User>> load(List<String> userIds, 
+                                             BatchLoaderEnvironment env) {
+        // One DB query for ALL user IDs
+        List<User> users = userRepository.findAllById(userIds);
         
-        responseObserver.onNext(update);   // push each update
+        // Must return in same order as input IDs
+        Map<String, User> userMap = users.stream()
+            .collect(Collectors.toMap(User::getId, u -> u));
         
-        if (event.isFinal()) {
-            responseObserver.onCompleted(); // close when delivered/cancelled
-        }
-    });
-}
-
-// Client consumption
-stub.streamOrderUpdates(request, new StreamObserver<OrderUpdate>() {
-    @Override
-    public void onNext(OrderUpdate update) {
-        System.out.println("Status: " + update.getStatus());
-    }
-    
-    @Override
-    public void onError(Throwable t) {
-        System.err.println("Stream error: " + t.getMessage());
-    }
-    
-    @Override
-    public void onCompleted() {
-        System.out.println("Order tracking complete");
-    }
-});
-```
-
----
-
-### Pattern 3 — Client Streaming RPC
-
-```protobuf
-service InventoryService {
-  rpc BulkUpdateStock (stream StockUpdateRequest) returns (BulkUpdateResponse);
-}
-```
-
-```
-Client                              Server
-  |--- StockUpdate (product 1) --->|
-  |--- StockUpdate (product 2) --->|
-  |--- StockUpdate (product 3) --->|  ← client streams many requests
-  |--- stream closed           --->|
-  |<-- BulkUpdateResponse      ----|  ← server responds once at the end
-```
-
-**When to use:** Client sends a large amount of data — bulk imports, chunked file uploads, batch operations. Instead of one massive request, stream it piece by piece.
-
-```java
-// Client streaming
-StreamObserver<StockUpdateRequest> requestObserver = 
-    stub.bulkUpdateStock(new StreamObserver<BulkUpdateResponse>() {
-        @Override
-        public void onNext(BulkUpdateResponse response) {
-            System.out.println("Updated: " + response.getUpdatedCount());
-        }
-        @Override
-        public void onError(Throwable t) { /* handle */ }
-        @Override
-        public void onCompleted() { /* done */ }
-    });
-
-// Stream 10,000 product stock updates
-for (StockUpdate update : stockUpdates) {
-    requestObserver.onNext(StockUpdateRequest.newBuilder()
-        .setProductId(update.getProductId())
-        .setNewStock(update.getStock())
-        .build());
-}
-requestObserver.onCompleted(); // signal end of stream
-```
-
----
-
-### Pattern 4 — Bidirectional Streaming RPC
-
-```protobuf
-service ChatService {
-  rpc Chat (stream ChatMessage) returns (stream ChatMessage);
-}
-```
-
-```
-Client                    Server
-  |--- Message A -------->|
-  |<-- Message B  --------|
-  |--- Message C -------->|   ← both sides stream simultaneously
-  |<-- Message D  --------|
-  |--- close stream ------>|
-  |<-- close stream -------|
-```
-
-**When to use:** Real-time bidirectional communication — live chat, collaborative editing, multiplayer game state sync, real-time trading.
-
-```java
-StreamObserver<ChatMessage> requestObserver = 
-    stub.chat(new StreamObserver<ChatMessage>() {
-        @Override
-        public void onNext(ChatMessage message) {
-            // Received message from server
-            displayMessage(message.getSender(), message.getText());
-        }
-        @Override
-        public void onError(Throwable t) { reconnect(); }
-        @Override
-        public void onCompleted() { System.out.println("Chat ended"); }
-    });
-
-// Send messages
-requestObserver.onNext(ChatMessage.newBuilder()
-    .setSender("u-123")
-    .setText("Hello!")
-    .build());
-```
-
----
-
-## gRPC Error Handling
-
-gRPC has its own status codes — separate from HTTP status codes:
-
-| gRPC Status | Code | Meaning |
-|---|---|---|
-| OK | 0 | Success |
-| CANCELLED | 1 | Client cancelled the request |
-| UNKNOWN | 2 | Unknown error |
-| INVALID_ARGUMENT | 3 | Bad input (like HTTP 400) |
-| NOT_FOUND | 5 | Resource not found (like HTTP 404) |
-| ALREADY_EXISTS | 6 | Conflict (like HTTP 409) |
-| PERMISSION_DENIED | 7 | Authorisation failure (like HTTP 403) |
-| RESOURCE_EXHAUSTED | 8 | Rate limited (like HTTP 429) |
-| UNAUTHENTICATED | 16 | Not authenticated (like HTTP 401) |
-| UNAVAILABLE | 14 | Service down (like HTTP 503) |
-| DEADLINE_EXCEEDED | 4 | Timeout |
-
-```java
-// Server — throwing a gRPC error
-@Override
-public void getOrder(GetOrderRequest request,
-                     StreamObserver<OrderResponse> responseObserver) {
-    Order order = orderRepository.findById(request.getOrderId());
-    
-    if (order == null) {
-        responseObserver.onError(
-            Status.NOT_FOUND
-                .withDescription("Order " + request.getOrderId() + " not found")
-                .asRuntimeException()
+        return CompletableFuture.completedFuture(
+            userIds.stream()
+                   .map(id -> userMap.getOrDefault(id, null))
+                   .collect(Collectors.toList())
         );
-        return;
     }
-    
-    if (!order.getUserId().equals(request.getCallerId())) {
-        responseObserver.onError(
-            Status.PERMISSION_DENIED
-                .withDescription("You do not own this order")
-                .asRuntimeException()
-        );
-        return;
-    }
-    
-    responseObserver.onNext(buildResponse(order));
-    responseObserver.onCompleted();
 }
 
-// Client — handling errors
-try {
-    OrderResponse response = stub.getOrder(request);
-} catch (StatusRuntimeException e) {
-    switch (e.getStatus().getCode()) {
-        case NOT_FOUND:
-            // handle 404 equivalent
-            break;
-        case PERMISSION_DENIED:
-            // handle 403 equivalent
-            break;
-        case UNAVAILABLE:
-            // retry with backoff
-            break;
+// Use DataLoader in resolver
+@SchemaMapping(typeName = "Order", field = "customer")
+public CompletableFuture<User> customer(Order order, DataLoader<String, User> userLoader) {
+    // This does NOT fire a DB query immediately
+    // DataLoader batches all customer IDs across all order resolvers
+    // then fires ONE query for all of them
+    return userLoader.load(order.getCustomerId());
+}
+```
+
+**The execution with DataLoader:**
+```
+GraphQL resolves Order.customer for all 20 orders
+  → Calls userLoader.load("u-001")   ← queued, not executed
+  → Calls userLoader.load("u-002")   ← queued
+  → ...
+  → Calls userLoader.load("u-020")   ← queued
+
+End of execution tick — DataLoader fires:
+  SELECT * FROM users WHERE id IN ('u-001','u-002',...,'u-020')
+  → 1 query instead of 20
+
+Total queries for the same request:
+1   query for orders
+1   query for all customers (batched)
+1   query for all order items (batched)
+1   query for all products   (batched)
+────────────────────
+4 DB queries instead of 141
+```
+
+---
+
+## Connections and Pagination — The Relay Pattern
+
+GraphQL has a standard pagination pattern called **Relay Connections** — used by Facebook, GitHub, Shopify:
+
+```graphql
+type Query {
+  orders(first: Int, after: String, last: Int, before: String): OrderConnection!
+}
+
+type OrderConnection {
+  edges:    [OrderEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type OrderEdge {
+  node:   Order!         # the actual order
+  cursor: String!        # opaque cursor for this position
+}
+
+type PageInfo {
+  hasNextPage:     Boolean!
+  hasPreviousPage: Boolean!
+  startCursor:     String
+  endCursor:       String
+}
+```
+
+**Client query:**
+```graphql
+{
+  orders(first: 20, after: "cursor-abc") {
+    edges {
+      cursor
+      node {
+        id
+        status
+        total
+      }
     }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    totalCount
+  }
+}
+```
+
+**Why this pattern:**
+- Cursors are stable — insertions don't cause duplicates or skips
+- `edges` wrapper allows adding metadata per item (cursor, relevance score)
+- `pageInfo` tells client exactly what to request next
+- Forward and backward pagination both supported
+- Industry standard — any GraphQL client library understands it
+
+---
+
+## Mutations — Design Patterns
+
+**Input types — always use dedicated input types:**
+```graphql
+# Bad — scalar arguments directly
+mutation {
+  createOrder(userId: ID!, items: [ID!]!, paymentMethodId: ID!)
+}
+
+# Good — input type
+mutation {
+  createOrder(input: CreateOrderInput!): OrderPayload!
+}
+
+input CreateOrderInput {
+  items:             [OrderItemInput!]!
+  paymentMethodId:   ID!
+  shippingAddressId: ID!
+  promoCode:         String
+}
+```
+
+Input types can be evolved — add optional fields without breaking existing mutations.
+
+**Payload types — always return both data and errors:**
+```graphql
+type OrderPayload {
+  order:  Order          # null if mutation failed
+  errors: [UserError!]!  # empty array if success
+}
+
+type UserError {
+  field:   String        # which field caused the error
+  message: String!       # human-readable description
+  code:    String        # machine-readable error code
+}
+```
+
+**Why this pattern instead of throwing GraphQL errors:**
+```graphql
+# Client handles gracefully — no exception handling needed
+mutation CreateOrder($input: CreateOrderInput!) {
+  createOrder(input: $input) {
+    order {
+      id
+      status
+    }
+    errors {
+      field
+      message
+    }
+  }
+}
+
+# Client code
+if (data.createOrder.errors.length > 0) {
+  showValidationErrors(data.createOrder.errors)
+} else {
+  showOrderConfirmation(data.createOrder.order)
 }
 ```
 
 ---
 
-## gRPC Interceptors — Cross-Cutting Concerns
+## GraphQL Security
 
-Interceptors in gRPC are the equivalent of Spring filters/middleware — they run on every call without touching business logic:
+GraphQL's flexibility is also its attack surface. Production GraphQL must be hardened:
 
-```java
-// Server-side interceptor — JWT authentication for all gRPC calls
-public class AuthInterceptor implements ServerInterceptor {
-    
-    @Override
-    public <Req, Resp> ServerCall.Listener<Req> interceptCall(
-            ServerCall<Req, Resp> call,
-            Metadata headers,
-            ServerCallHandler<Req, Resp> next) {
-        
-        String token = headers.get(
-            Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER)
-        );
-        
-        if (token == null || !jwtService.isValid(token)) {
-            call.close(Status.UNAUTHENTICATED
-                .withDescription("Invalid or missing token"), new Metadata());
-            return new ServerCall.Listener<>() {};
+**1. Query Depth Limiting:**
+```graphql
+# Malicious query — infinite nesting crashes the server
+{
+  orders {
+    customer {
+      orders {
+        customer {
+          orders {
+            customer { ... }  # 50 levels deep
+          }
         }
-        
-        // Token valid — proceed to actual handler
-        return next.startCall(call, headers);
+      }
     }
+  }
 }
+```
+```java
+// Spring for GraphQL — limit depth
+GraphQlSource.schemaResourceBuilder()
+    .instrumentation(new MaxQueryDepthInstrumentation(10))
+```
 
-// Register interceptor on server
-Server server = ServerBuilder.forPort(9090)
-    .addService(ServerInterceptors.intercept(
-        new OrderServiceImpl(), new AuthInterceptor(), new LoggingInterceptor()
-    ))
-    .build();
+**2. Query Complexity Scoring:**
+```
+Assign a cost to each field:
+  Scalar field:  cost = 1
+  Object field:  cost = 1
+  List field:    cost = 10 (fetches many)
+  
+Total query cost must not exceed a threshold (e.g. 1000)
+
+Complex attack query:
+  orders (cost 10) × items (cost 10) × product (cost 1) × reviews (cost 10) = 1000+ → rejected
+```
+
+**3. Persisted Queries:**
+```
+Development: clients send arbitrary query strings
+Production:  clients register queries with a hash during build
+
+Client sends:  { "id": "abc123hash" }
+Server looks up: "abc123hash" → stored query → executes
+Unknown hash → rejected
+
+Benefits:
+  - Arbitrary query injection is impossible
+  - Smaller payloads (hash vs full query string)
+  - Easier whitelisting and auditing
+```
+
+**4. Rate Limiting by Query Cost:**
+```
+Instead of rate limiting by request count:
+  100 requests/minute (standard)
+
+Rate limit by complexity points:
+  10,000 complexity points/minute
+
+Simple queries (cost 10) → 1000 requests/minute
+Complex queries (cost 500) → 20 requests/minute
+```
+
+**5. Disable Introspection in Production:**
+```java
+// Introspection lets anyone discover your entire schema
+// Useful in development, dangerous in production
+graphql:
+  schema:
+    introspection:
+      enabled: false  # disable in prod
 ```
 
 ---
 
-## Real-World Example — ShopSphere Internal gRPC Architecture
+## Real-World Example — ShopSphere GraphQL BFF
 
-**Proto definitions across ShopSphere services:**
+ShopSphere uses GraphQL as a **BFF (Backend For Frontend)** layer — sitting between external clients and internal gRPC services:
 
-```protobuf
-// order-service/src/main/proto/order.proto
-syntax = "proto3";
-package com.shopsphere.order;
+```
+Mobile App  ──► GraphQL BFF ──gRPC──► Order Service
+Web App     ──►             ──gRPC──► Product Service
+                            ──gRPC──► User Service
+                            ──gRPC──► Inventory Service
+```
 
-service OrderService {
-  rpc CreateOrder        (CreateOrderRequest)  returns (OrderResponse);
-  rpc GetOrder           (GetOrderRequest)     returns (OrderResponse);
-  rpc CancelOrder        (CancelOrderRequest)  returns (OrderResponse);
-  rpc StreamOrderUpdates (GetOrderRequest)     returns (stream OrderUpdate);
-}
+**Why this architecture:**
+- Mobile app needs different data shapes than web app — GraphQL handles both with one schema
+- Reduces mobile bandwidth — app requests only the fields it renders
+- Reduces round trips — one GraphQL query replaces 4–5 REST calls
+- Internal services stay gRPC — fast, typed, streaming
+- GraphQL BFF translates between client needs and internal service contracts
 
-// inventory-service/src/main/proto/inventory.proto
-service InventoryService {
-  rpc CheckStock    (CheckStockRequest)  returns (StockResponse);
-  rpc ReserveStock  (ReserveRequest)     returns (ReserveResponse);
-  rpc ReleaseStock  (ReleaseRequest)     returns (ReleaseResponse);
-  rpc BulkSync      (stream SyncRequest) returns (SyncSummary);
-}
+**A real mobile screen — order history with product thumbnails:**
 
-// payment-service/src/main/proto/payment.proto
-service PaymentService {
-  rpc ProcessPayment (PaymentRequest)  returns (PaymentResponse);
-  rpc RefundPayment  (RefundRequest)   returns (RefundResponse);
+```graphql
+# Mobile sends one query
+query OrderHistory($userId: ID!, $first: Int!) {
+  me {
+    orders(first: $first) {
+      edges {
+        node {
+          id
+          status
+          createdAt
+          total
+          items {
+            quantity
+            product {
+              name
+              thumbnailUrl    # mobile only needs thumbnail, not full image list
+              price
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
 }
 ```
 
-**Order creation flow using gRPC internally:**
-
+**BFF resolver translating to gRPC:**
 ```java
-// OrderService calls InventoryService and PaymentService via gRPC
-@Service
-public class OrderCreationService {
+@SchemaMapping(typeName = "Query", field = "me")
+public CompletableFuture<User> me(GraphQLContext context) {
+    String userId = context.get("userId"); // from JWT
     
-    private final InventoryServiceGrpc.InventoryServiceBlockingStub inventoryStub;
-    private final PaymentServiceGrpc.PaymentServiceBlockingStub paymentStub;
+    // Call User Service via gRPC
+    return userServiceStub.getUser(
+        GetUserRequest.newBuilder().setUserId(userId).build()
+    ).toCompletableFuture().thenApply(this::mapToGraphQLUser);
+}
+
+@SchemaMapping(typeName = "User", field = "orders")
+public CompletableFuture<OrderConnection> orders(
+        User user,
+        @Argument int first,
+        @Argument String after) {
     
-    public Order createOrder(CreateOrderRequest request) {
-        
-        // 1. Check stock via gRPC — synchronous, blocking
-        StockResponse stockCheck = inventoryStub
-            .withDeadlineAfter(500, TimeUnit.MILLISECONDS)  // 500ms timeout
-            .checkStock(CheckStockRequest.newBuilder()
-                .addAllProductIds(request.getItemsList()
-                    .stream().map(Item::getProductId).toList())
-                .build());
-        
-        if (!stockCheck.getAllAvailable()) {
-            throw new OutOfStockException(stockCheck.getUnavailableProductsList());
-        }
-        
-        // 2. Reserve stock
-        inventoryStub.reserveStock(ReserveRequest.newBuilder()
-            .setOrderId(tempOrderId)
-            .addAllItems(request.getItemsList())
-            .build());
-        
-        // 3. Process payment via gRPC
-        PaymentResponse payment = paymentStub
-            .withDeadlineAfter(3000, TimeUnit.MILLISECONDS)
-            .processPayment(PaymentRequest.newBuilder()
-                .setUserId(request.getUserId())
-                .setAmount(calculateTotal(request.getItemsList()))
-                .setPaymentMethodId(request.getPaymentMethodId())
-                .build());
-        
-        if (!payment.getSuccess()) {
-            inventoryStub.releaseStock(...); // compensate
-            throw new PaymentFailedException(payment.getFailureReason());
-        }
-        
-        // 4. Save order, publish events, return response
-        return saveAndPublish(request, payment);
-    }
+    // Call Order Service via gRPC
+    return orderServiceStub.listOrders(
+        ListOrdersRequest.newBuilder()
+            .setUserId(user.getId())
+            .setPageSize(first)
+            .setCursor(after != null ? after : "")
+            .build()
+    ).toCompletableFuture().thenApply(this::mapToConnection);
 }
 ```
 
@@ -555,21 +596,21 @@ public class OrderCreationService {
 
 ## Interview Q&A
 
-**Q: Why would you choose gRPC over REST for internal microservice communication?**
-gRPC uses Protobuf binary encoding which is 3–10x smaller and 5–10x faster to serialise than JSON. It runs on HTTP/2 which multiplexes multiple concurrent calls over one connection. The strongly typed proto contract is enforced at compile time — breaking changes are caught before deployment, not at runtime. Native support for four communication patterns including streaming makes it versatile for real-time use cases. The only cost is loss of human readability and browser incompatibility, which do not matter for internal service-to-service calls.
+**Q: What is the N+1 problem in GraphQL and how does DataLoader solve it?**
+The N+1 problem occurs because GraphQL resolves each field independently. Fetching 20 orders where each needs a customer lookup triggers 1 query for orders and 20 separate queries for customers — 21 total. DataLoader solves this with batching and caching. It collects all customer IDs requested during a single execution tick, fires one batched `WHERE id IN (...)` query, then maps results back to individual resolvers. The same request goes from 21 queries to 2.
 
-**Q: What is Protobuf and how does it achieve smaller message sizes than JSON?**
-Protobuf is a binary serialisation format where the schema is defined in a `.proto` file. Instead of including field names in every message like JSON does, Protobuf uses compact field numbers. Small integers are encoded using variable-length encoding consuming as little as one byte. The combination of binary encoding, field numbers instead of names, and varint compression results in messages 3–10x smaller than equivalent JSON, with significantly faster serialisation and deserialisation.
+**Q: What is a GraphQL BFF and why would you use it?**
+A BFF — Backend For Frontend — is a GraphQL layer sitting between clients and internal microservices. It aggregates data from multiple services into client-specific shapes in a single query. Mobile clients get only the fields they need for their screens, eliminating over-fetching on limited bandwidth. It decouples frontend teams from backend service contracts — UI changes don't require backend changes as long as the underlying data exists. Internal services stay as gRPC or REST, and the BFF translates between client needs and service contracts.
 
-**Q: How does gRPC handle backward compatibility as services evolve?**
-Protobuf's field number system enables safe evolution. Adding new optional fields with new field numbers is always backward compatible — old clients ignore unknown fields, new clients handle missing fields gracefully. You must never change a field's type or reuse a field number — doing so corrupts data in old clients. Removed fields should be marked `reserved` to prevent accidental reuse. This allows independent deployment of services without coordinated upgrades, which is essential in microservices.
+**Q: How do you prevent GraphQL from being abused with malicious queries?**
+Four layers of defence — depth limiting prevents infinite nested queries from crashing the server, complexity scoring assigns a cost to each field and rejects queries exceeding a threshold, persisted queries allow only pre-registered query hashes in production making arbitrary query injection impossible, and rate limiting by complexity points penalises expensive queries more heavily than cheap ones. Introspection should also be disabled in production to prevent schema discovery.
 
-**Q: What is deadline propagation in gRPC and why does it matter?**
-A deadline is an absolute point in time by which a call must complete — set on the client with `withDeadlineAfter()`. Critically, deadlines propagate through the call chain — if the API Gateway gives the Order Service 2 seconds, the Order Service should pass a proportionally smaller deadline to the Payment Service. Without propagation, a slow downstream service can hold resources indefinitely even after the original caller has given up and moved on. Proper deadline propagation prevents resource leaks and cascading slowdowns across the entire call graph.
+**Q: What is the Relay Connection pattern and why use it over simple list pagination?**
+Relay Connections wrap list results in an edges/node/cursor structure with a PageInfo object. Cursors are opaque and stable — unlike offset pagination, insertions don't cause duplicate or skipped items. The pageInfo provides hasNextPage and endCursor making client-side pagination logic trivial. It supports both forward and backward pagination. Being a GraphQL community standard, all major client libraries understand it natively — Apollo Client, Relay, URQL all handle it automatically.
 
-**Q: What is the difference between a gRPC deadline and a timeout?**
-A timeout is a duration — "wait 500ms". A deadline is an absolute timestamp — "this entire operation must complete by 10:30:00.500". Deadlines are better in distributed systems because they propagate naturally across service calls — each downstream service knows exactly how much time remains for the entire operation, not just its individual slice. A timeout resets at each hop — a 500ms timeout at each of five services could take 2.5 seconds total while the original caller expected 500ms.
+**Q: When would you choose GraphQL over REST in a system design interview?**
+GraphQL is the right choice when clients have diverse and evolving data needs — mobile apps needing minimal payloads, web apps needing richer data, third-party developers building unknown use cases. It eliminates over-fetching and under-fetching, removes the need for API versioning for additive changes, and lets frontend teams move independently of backend teams. The cost is complexity — DataLoader for N+1, security hardening against query attacks, and more complex caching compared to REST's HTTP-layer caching. For simple CRUD services with predictable access patterns, REST is simpler and sufficient.
 
 ---
 
-Say **"next"** when ready for Topic 4 — GraphQL (Deep Dive).
+Say **"next"** when ready for Topic 5 — Synchronous vs Asynchronous Communication.
