@@ -1,4 +1,4 @@
-# Stage 2 — Topic 7: Publisher-Subscriber Model
+# Stage 2 — Topic 8: Publisher-Subscriber Model
 
 ## Theory
 
